@@ -216,6 +216,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
+    "gate-set", "uat-verdict", "gate-except",
     "gc",
 })
 
@@ -356,6 +357,20 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
+    gate = None
+    gate_kind = getattr(args, "gate_kind", None)
+    uat_ids = list(getattr(args, "uat", None) or [])
+    repair_lane = list(getattr(args, "repair_lane", None) or [])
+    if gate_kind:
+        if gate_kind in kb._uat.PROTECTED_GATE_KINDS and not uat_ids:
+            return _err(f"kanban: --gate-kind {gate_kind} requires at least one --uat card id", 2)
+        gate = {"kind": gate_kind}
+        if uat_ids:
+            gate["uat"] = uat_ids
+        if repair_lane:
+            gate["repair_lane"] = repair_lane
+    elif uat_ids or repair_lane:
+        return _err("kanban: --uat/--repair-lane require --gate-kind", 2)
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
             conn, title=args.title, body=args.body, assignee=args.assignee,
@@ -370,6 +385,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
+            gate=gate,
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
@@ -1050,6 +1066,78 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
 
 
+def _cmd_gate_set(args: argparse.Namespace) -> int:
+    """Type a card as a protected gate (merge/deploy/live) or a UAT card."""
+    kind = args.kind
+    uat_ids = list(getattr(args, "uat", None) or [])
+    repair = list(getattr(args, "repair_lane", None) or [])
+    author = _profile_author()
+    with kbc.connect_closing() as conn:
+        try:
+            ok = kb.set_task_gate(conn, args.task_id, kind=kind, uat_ids=uat_ids,
+                                  repair_lane=repair, actor=author)
+        except ValueError as exc:
+            return _err(f"kanban: {exc}", 2)
+    if not ok:
+        return _err(f"cannot type {args.task_id} (unknown id)")
+    print(f"Typed {args.task_id} as gate.kind={kind}"
+          + (f" (uat: {', '.join(uat_ids)})" if uat_ids else ""))
+    return 0
+
+
+def _cmd_uat_verdict(args: argparse.Namespace) -> int:
+    """Record an exact machine-readable UAT verdict on a UAT card."""
+    author = getattr(args, "author", None) or _profile_author()
+    with kbc.connect_closing() as conn:
+        ok, reason = kb.record_uat_verdict(
+            conn, args.task_id, result=args.result, coverage=args.coverage, actor=author,
+        )
+    if not ok:
+        return _err(f"cannot record UAT verdict for {args.task_id}: {reason}")
+    print(f"Recorded UAT verdict {args.result}/{args.coverage} on {args.task_id}")
+    return 0
+
+
+def _cmd_gate_except(args: argparse.Namespace) -> int:
+    """Record an explicit, scoped, attributable UAT-gate exception."""
+    author = getattr(args, "actor", None) or _profile_author()
+    reason = _joined_words(getattr(args, "reason", None))
+    with kbc.connect_closing() as conn:
+        ok, err = kb.add_gate_exception(
+            conn, args.task_id, uat=args.uat, actor=author, reason=reason,
+            expires_at=getattr(args, "expires_at", None),
+        )
+    if not ok:
+        return _err(f"cannot add gate exception on {args.task_id}: {err}")
+    print(f"Recorded gate exception on {args.task_id} for UAT {args.uat} (by {author})")
+    return 0
+
+
+def _cmd_gate_audit(args: argparse.Namespace) -> int:
+    """Adoption/migration audit: typed protected/UAT cards + untyped count."""
+    with kbc.connect_closing() as conn:
+        report = kb.audit_gates(conn)
+    if _json_out(args, report):
+        return 0
+    print(f"Typed cards: {report['typed_count']}  Untyped (ungated): {report['untyped_count']}")
+    if report["protected"]:
+        print("\nProtected gate cards:")
+        for p in report["protected"]:
+            state = "OPEN" if p["uat_ready"] else "CLOSED"
+            print(f"  {p['id']}  {p['kind']:6s}  [{state}]  {p['title']}")
+            if not p["uat_ready"] and p["reason"]:
+                print(f"      {p['reason']}")
+    if report["uat_cards"]:
+        print("\nUAT cards:")
+        for u in report["uat_cards"]:
+            v = u["verdict"] or {}
+            label = f"{v.get('result', '-')}/{v.get('coverage', '-')}" if v else "no verdict"
+            print(f"  {u['id']}  [{'PASS' if u['passing'] else 'not-passing'}]  {label}  {u['title']}")
+    print("\nNote: untyped cards are never gated. Typing is explicit and opt-in; "
+          "this audit does not guess which untyped cards should be protected.")
+    return 0
+
+
 def _cmd_stats(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         stats = kb.board_stats(conn)
@@ -1244,6 +1332,8 @@ _HANDLERS = {
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
     "gc": _cmd_gc,
+    "gate-set": _cmd_gate_set, "uat-verdict": _cmd_uat_verdict,
+    "gate-except": _cmd_gate_except, "gate-audit": _cmd_gate_audit,
 }
 
 

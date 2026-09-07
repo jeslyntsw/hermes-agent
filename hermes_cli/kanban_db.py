@@ -28,6 +28,8 @@ from typing import Any, Iterable, Optional
 
 from toolsets import get_toolset_names
 
+from hermes_cli import kanban_uat_gate as _uat
+
 _log = logging.getLogger(__name__)
 
 
@@ -715,12 +717,17 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Explicit structured card/gate metadata for the fail-closed UAT gate; None
+    # for untyped cards. See ``hermes_cli.kanban_uat_gate``.
+    gate: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         g = lambda col, default=None: _row_get(row, col, default)  # noqa: E731
         parsed = _json_or(g("skills"))
         skills_value = [str(s) for s in parsed if s] if isinstance(parsed, list) else None
+        gate_raw = g("gate")
+        gate_value = gate_raw if isinstance(gate_raw, dict) else _json_or(gate_raw)
         return cls(
             **{col: row[col] for col in _TASK_REQUIRED_COLUMNS},
             **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
@@ -732,6 +739,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            gate=gate_value if isinstance(gate_value, dict) else None,
         )
 
 
@@ -941,7 +949,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Explicit structured card/gate metadata (JSON) for the fail-closed UAT
+    -- gate. For a protected card: ``{"kind":"merge"|"deploy"|"live",
+    -- "uat":[card_ids], "repair_lane":[card_ids], "exceptions":[...]}``. For a
+    -- UAT card: ``{"kind":"uat","verdict":{"result":"PASS","coverage":
+    -- "complete",...}}``. NULL = untyped card, never gated (legacy behaviour).
+    -- Read-only consumer logic lives in ``hermes_cli.kanban_uat_gate``.
+    gate                 TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1230,6 +1245,7 @@ def create_task(
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    gate: Optional[dict] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1246,6 +1262,7 @@ def create_task(
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
+    gate_json = _normalize_gate_metadata(gate)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
@@ -1322,8 +1339,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract, gate
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1333,6 +1350,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        gate_json,
                     ),
                 )
                 for pid in parents:
@@ -2025,6 +2043,12 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
                 "WHERE l.child_id = ?", (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                # Fail-closed UAT gate: a protected card whose declared UAT
+                # cards have not all passed stays where it is (never auto-flips
+                # to a claimable lane). No event here — the precise reason is
+                # surfaced at the promote/claim/dispatch boundary.
+                if not _uat_gate_open(conn, task_id):
+                    continue
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
@@ -2139,6 +2163,20 @@ def claim_task(
             )
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
             return None
+        # Fail-closed UAT gate: a protected card with failing/missing UAT never
+        # reaches 'running'. Demote to 'todo'; recompute_ready will NOT
+        # re-promote it while the gate is closed, so there is no churn loop.
+        gate_decision = _uat.evaluate(conn, task_id)
+        if not gate_decision.allowed:
+            conn.execute(
+                "UPDATE tasks SET status = 'todo' "
+                "WHERE id = ? AND status = 'ready'", (task_id,),
+            )
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": "uat_gate", "detail": gate_decision.reason},
+            )
+            return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
@@ -2171,6 +2209,18 @@ def claim_review_task(
                 _append_event(
                     conn, task_id, "dependency_wait",
                     {"reason": "parent_reopened", "source_status": "review"},
+                )
+            return None
+        gate_decision = _uat.evaluate(conn, task_id)
+        if not gate_decision.allowed:
+            demoted = conn.execute(
+                "UPDATE tasks SET status = 'todo' "
+                "WHERE id = ? AND status = 'review' AND claim_lock IS NULL", (task_id,),
+            )
+            if demoted.rowcount == 1:
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {"reason": "uat_gate", "detail": gate_decision.reason, "source_status": "review"},
                 )
             return None
         run_id = _claim_and_open_run(
@@ -2519,7 +2569,7 @@ def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
-    fire_lifecycle_hook: bool = True,
+    fire_lifecycle_hook: bool = True, uat_verdict: Optional[dict] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2571,6 +2621,11 @@ def complete_task(
             params = (*params, int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
             return False
+        # Record the UAT verdict atomically with the terminal flip: a
+        # cross-session reader can never observe ``done`` before the verdict
+        # lands, so it can't reinterpret a still-unverdicted card as passing.
+        if uat_verdict is not None:
+            _merge_uat_verdict_in_txn(conn, task_id, uat_verdict)
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
@@ -3165,6 +3220,265 @@ def request_changes(
     return True, implementer
 
 
+# --- Fail-closed UAT gate: typing, verdicts, exceptions, enforcement -------
+#
+# All card typing is EXPLICIT structured metadata in ``tasks.gate`` (JSON).
+# Nothing here inspects titles or bodies. Read-only decision logic lives in
+# ``hermes_cli.kanban_uat_gate``; this module owns the writes + audit events and
+# the enforcement hooks in promote/unblock/claim/recompute.
+
+
+def _normalize_gate_metadata(gate: Optional[dict]) -> Optional[str]:
+    """Validate + serialise gate metadata for storage on ``tasks.gate``.
+
+    Accepts either a protected-card config (``kind`` in
+    :data:`kanban_uat_gate.PROTECTED_GATE_KINDS` with a non-empty ``uat`` list)
+    or a UAT-card marker (``kind == 'uat'``). Returns compact JSON, or None for
+    an untyped card. Raises ``ValueError`` on a malformed gate so a bad config
+    can never be persisted (and later silently open or wedge a gate)."""
+    if gate is None:
+        return None
+    if not isinstance(gate, dict):
+        raise ValueError("gate must be a dict")
+    kind = gate.get("kind")
+    if kind not in _uat.VALID_GATE_KINDS:
+        raise ValueError(
+            f"gate.kind must be one of {_uat.VALID_GATE_KINDS}, got {kind!r}"
+        )
+    # A gate config supplied at create/type time may NEVER carry an inline
+    # exception or verdict: those are the two audited "grant" surfaces and must
+    # flow ONLY through add_gate_exception / record_uat_verdict (+ completion),
+    # which validate scope/actor/reason/enum and emit an audit event. Accepting
+    # them inline here would be a silent, unaudited fail-open bypass.
+    if gate.get("exceptions"):
+        raise ValueError(
+            "inline gate exceptions are not allowed; grant them via "
+            "add_gate_exception (hermes kanban gate-except)"
+        )
+    if gate.get("verdict"):
+        raise ValueError(
+            "inline UAT verdicts are not allowed; record them via "
+            "record_uat_verdict (hermes kanban uat-verdict) or completion"
+        )
+    out: dict[str, Any] = {"kind": kind}
+    if kind in _uat.PROTECTED_GATE_KINDS:
+        uat_ids = _uat.required_uat_ids(gate)
+        if not uat_ids:
+            raise ValueError(f"protected {kind} gate requires a non-empty 'uat' card id list")
+        out["uat"] = uat_ids
+        repair = _uat.repair_lane_ids(gate)
+        if repair:
+            out["repair_lane"] = repair
+    return json.dumps(out, separators=(",", ":"))
+
+
+def _load_gate(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    row = conn.execute("SELECT gate FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return None
+    return _uat.parse_gate(row["gate"])
+
+
+def evaluate_uat_gate(conn: sqlite3.Connection, task_id: str) -> "_uat.GateDecision":
+    """Public wrapper over :func:`kanban_uat_gate.evaluate` (read-only)."""
+    return _uat.evaluate(conn, task_id)
+
+
+def _uat_gate_open(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when ``task_id`` is unprotected or its UAT gate is satisfied.
+
+    The single readiness predicate shared by ``recompute_ready`` and the claim
+    paths so a protected card with failing/missing UAT never reaches
+    ``running`` by ANY route."""
+    return _uat.evaluate(conn, task_id).allowed
+
+
+def set_task_gate(
+    conn: sqlite3.Connection, task_id: str, *, kind: str,
+    uat_ids: Iterable[str] = (), repair_lane: Iterable[str] = (),
+    actor: Optional[str] = None,
+) -> bool:
+    """Type a card as a protected gate (merge/deploy/live) or a UAT card.
+
+    A protected kind requires ``uat_ids``. Marking a card as ``uat`` preserves
+    any already-recorded verdict. Returns False when the task does not exist.
+    Emits an auditable ``gate_configured`` event."""
+    config: dict[str, Any] = {"kind": kind}
+    if kind in _uat.PROTECTED_GATE_KINDS:
+        config["uat"] = list(uat_ids)
+        if repair_lane:
+            config["repair_lane"] = list(repair_lane)
+    gate_json = _normalize_gate_metadata(config)
+    with write_txn(conn):
+        existing = conn.execute("SELECT gate FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if existing is None:
+            return False
+        # Preserve an existing UAT verdict / exceptions across a re-type of the
+        # same kind so a re-config can't silently erase evidence.
+        prior = _uat.parse_gate(existing["gate"]) or {}
+        merged = json.loads(gate_json)
+        if kind == _uat.UAT_KIND and isinstance(prior.get("verdict"), dict):
+            merged["verdict"] = prior["verdict"]
+        if kind in _uat.PROTECTED_GATE_KINDS and isinstance(prior.get("exceptions"), list):
+            merged.setdefault("exceptions", prior["exceptions"])
+        gate_json = json.dumps(merged, separators=(",", ":"))
+        conn.execute("UPDATE tasks SET gate = ? WHERE id = ?", (gate_json, task_id))
+        _append_event(
+            conn, task_id, "gate_configured",
+            {"kind": kind, "uat": merged.get("uat"),
+             "repair_lane": merged.get("repair_lane"), "actor": actor},
+        )
+    return True
+
+
+def record_uat_verdict(
+    conn: sqlite3.Connection, task_id: str, *, result: str, coverage: str,
+    actor: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Record an exact machine-readable UAT verdict on a UAT card.
+
+    Marks the card ``kind='uat'`` if it was untyped. The verdict is stored
+    durably in ``tasks.gate`` so no status-only path can reinterpret it.
+    Returns ``(ok, reason)``; ``ok`` is False on an unknown card or an invalid
+    verdict/coverage enum. Emits an auditable ``uat_verdict`` event."""
+    try:
+        verdict = _uat.build_verdict(result, coverage, actor=actor, at=int(time.time()))
+    except ValueError as exc:
+        return False, str(exc)
+    with write_txn(conn):
+        row = conn.execute("SELECT gate FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found"
+        gate = _uat.parse_gate(row["gate"]) or {}
+        # A protected merge/deploy/live card is not a UAT card; refuse to blur
+        # the roles (which would also clobber its uat/repair_lane config).
+        if _uat.is_protected(gate):
+            return False, f"task {task_id} is a protected {gate.get('kind')} card, not a UAT card"
+        gate["kind"] = _uat.UAT_KIND
+        gate["verdict"] = verdict
+        conn.execute(
+            "UPDATE tasks SET gate = ? WHERE id = ?",
+            (json.dumps(gate, separators=(",", ":")), task_id),
+        )
+        _append_event(conn, task_id, "uat_verdict", verdict)
+    return True, None
+
+
+def _merge_uat_verdict_in_txn(
+    conn: sqlite3.Connection, task_id: str, verdict_input: dict,
+) -> None:
+    """Record a UAT verdict INSIDE the caller's open write txn (used by
+    :func:`complete_task` so the verdict and the terminal flip commit atomically
+    — a cross-session reader can never see ``done`` before the verdict lands)."""
+    verdict = _uat.build_verdict(
+        verdict_input.get("result"), verdict_input.get("coverage"),
+        actor=verdict_input.get("by") or verdict_input.get("actor"),
+        at=int(time.time()),
+    )
+    row = conn.execute("SELECT gate FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    gate = _uat.parse_gate(row["gate"] if row else None) or {}
+    if _uat.is_protected(gate):
+        # Never let a completion clobber a protected card's uat/repair_lane
+        # config by re-typing it as a UAT card. Fail closed.
+        raise ValueError(
+            f"cannot record a UAT verdict on protected {gate.get('kind')} card {task_id}"
+        )
+    gate["kind"] = _uat.UAT_KIND
+    gate["verdict"] = verdict
+    conn.execute(
+        "UPDATE tasks SET gate = ? WHERE id = ?",
+        (json.dumps(gate, separators=(",", ":")), task_id),
+    )
+    _append_event(conn, task_id, "uat_verdict", verdict)
+
+
+def add_gate_exception(
+    conn: sqlite3.Connection, task_id: str, *, uat: str, actor: str,
+    reason: str, expires_at: Optional[int] = None,
+) -> tuple[bool, Optional[str]]:
+    """Record an explicit, scoped, attributable UAT-gate exception.
+
+    The exception must name a single UAT id the protected card actually
+    declares (no wildcard / broad bypass, no comment-based inference). Returns
+    ``(ok, reason)`` and emits an auditable ``gate_exception`` event."""
+    if not uat or not str(uat).strip():
+        return False, "exception must name a UAT card id"
+    if uat == "*":
+        return False, "wildcard exceptions are not allowed; name a specific UAT card id"
+    if not actor or not str(actor).strip():
+        return False, "exception requires an attributable actor"
+    if not reason or not str(reason).strip():
+        return False, "exception requires a reason"
+    with write_txn(conn):
+        row = conn.execute("SELECT gate FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found"
+        gate = _uat.parse_gate(row["gate"])
+        if not _uat.is_protected(gate):
+            return False, f"task {task_id} is not a protected gate card"
+        if uat not in _uat.required_uat_ids(gate):
+            return False, f"{uat} is not a declared UAT dependency of {task_id}"
+        entry = {
+            "uat": uat, "actor": str(actor).strip(), "reason": str(reason).strip(),
+            "at": int(time.time()),
+        }
+        if expires_at is not None:
+            entry["expires_at"] = int(expires_at)
+        exceptions = gate.get("exceptions")
+        if not isinstance(exceptions, list):
+            exceptions = []
+        exceptions.append(entry)
+        gate["exceptions"] = exceptions
+        conn.execute(
+            "UPDATE tasks SET gate = ? WHERE id = ?",
+            (json.dumps(gate, separators=(",", ":")), task_id),
+        )
+        _append_event(conn, task_id, "gate_exception", entry)
+    return True, None
+
+
+def audit_gates(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Adoption/migration audit over the board's gate typing (read-only).
+
+    Reports every protected gate card with its live UAT-gate status, every UAT
+    card, and how many cards remain untyped (and therefore ungated). This is a
+    purely STRUCTURAL check — it deliberately does NOT guess which untyped cards
+    *should* be typed (no title/body heuristics); that judgement stays with the
+    operator. See docs/kanban-uat-gate.md for the limitation this surfaces."""
+    rows = conn.execute("SELECT id, title, status, gate FROM tasks").fetchall()
+    protected: list[dict[str, Any]] = []
+    uat_cards: list[dict[str, Any]] = []
+    typed = 0
+    untyped = 0
+    for row in rows:
+        gate = _uat.parse_gate(row["gate"])
+        if gate is None or _uat.gate_kind(gate) is None:
+            untyped += 1
+            continue
+        typed += 1
+        if _uat.is_protected(gate):
+            decision = _uat.evaluate(conn, row["id"])
+            protected.append({
+                "id": row["id"], "title": row["title"], "status": row["status"],
+                "kind": _uat.gate_kind(gate), "uat": _uat.required_uat_ids(gate),
+                "repair_lane": _uat.repair_lane_ids(gate),
+                "uat_ready": bool(decision.allowed),
+                "reason": decision.reason,
+                "exceptions_used": decision.exceptions_used,
+            })
+        elif _uat.is_uat(gate):
+            verdict = _uat.verdict_of(gate)
+            uat_cards.append({
+                "id": row["id"], "title": row["title"], "status": row["status"],
+                "verdict": verdict,
+                "passing": _uat.verdict_problem(verdict) is None,
+            })
+    return {
+        "protected": protected, "uat_cards": uat_cards,
+        "typed_count": typed, "untyped_count": untyped,
+    }
+
+
 def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
     force: bool = False, dry_run: bool = False,
@@ -3194,6 +3508,13 @@ def promote_task(
                 f"unsatisfied parent dependencies: "
                 f"{', '.join(unsatisfied)} (use --force to override)"
             )
+
+    # The UAT gate is NOT overridable by --force: force only relaxes ordinary
+    # parent gating, never the fail-closed protected-card gate (req 4 — no broad
+    # bypass). Only an explicit, scoped exception opens it.
+    gate_decision = _uat.evaluate(conn, task_id)
+    if not gate_decision.allowed:
+        return False, gate_decision.reason
 
     if dry_run:
         return True, None
@@ -3258,6 +3579,11 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         # Re-gate on parent completion before restoring the source phase.
         landing_status = _landing_status_after_parents(conn, task_id)
+        # Fail-closed UAT gate: unblocking a protected card while its UAT is
+        # failing/missing must never release it to a claimable lane — it lands
+        # in 'todo' and waits (only the declared repair lane may proceed).
+        if landing_status == "ready" and not _uat_gate_open(conn, task_id):
+            landing_status = "todo"
         new_status = (
             "review"
             if landing_status == "ready" and resume_status == "review"

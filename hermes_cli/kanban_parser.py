@@ -13,6 +13,7 @@ import argparse
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_notify as kbn
+from hermes_cli import kanban_uat_gate as kug
 
 
 def _arg(*flags: str, **kw):
@@ -188,6 +189,16 @@ _SPECS = [
                   "the worker). Requires --model."),
         _arg("--completion-contract", metavar="CONTRACT",
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
+        _arg("--gate-kind", dest="gate_kind", choices=list(kug.VALID_GATE_KINDS),
+             help="Type this card for the fail-closed UAT gate: 'merge'/'deploy'/'live' "
+                  "make it a PROTECTED card (requires --uat), 'uat' marks it a UAT card. "
+                  "Untyped cards (the default) are never gated."),
+        _arg("--uat", action="append", default=[], metavar="CARD_ID",
+             help="Declared UAT card id this protected card gates on (repeatable). "
+                  "Every one must be terminal + PASS/complete before the card may progress."),
+        _arg("--repair-lane", dest="repair_lane", action="append", default=[], metavar="CARD_ID",
+             help="Card id in the sanctioned repair/re-UAT lane a failed UAT may release "
+                  "(repeatable). Recorded for audit; never a protected merge/deploy/LIVE card."),
         _arg("--goal", action="store_true", dest="goal_mode",
              help="Run the worker in a goal loop: after each turn a judge checks the "
                   "response against the card title/body and, if not done, the worker "
@@ -408,6 +419,34 @@ _SPECS = [
               "routed to specialist profiles by description. Falls back "
               "to specify-style single-task promotion when the task "
               "doesn't benefit from fan-out. Uses auxiliary.kanban_decomposer."),
+    _cmd("gate-set", [
+        _TASK_ID,
+        _arg("--kind", required=True, choices=list(kug.VALID_GATE_KINDS),
+             help="'merge'/'deploy'/'live' = protected card (requires --uat); 'uat' = UAT card"),
+        _arg("--uat", action="append", default=[], metavar="CARD_ID",
+             help="Declared UAT card id (repeatable; required for a protected kind)"),
+        _arg("--repair-lane", dest="repair_lane", action="append", default=[], metavar="CARD_ID",
+             help="Sanctioned repair/re-UAT lane card id a failed UAT may release (repeatable)"),
+    ], help="Type a card for the fail-closed UAT gate (protected merge/deploy/live, or a UAT card)"),
+    _cmd("uat-verdict", [
+        _TASK_ID,
+        _arg("--result", required=True, choices=list(kug.VALID_VERDICTS),
+             help="Exact machine-readable UAT verdict. Only PASS is passing."),
+        _arg("--coverage", required=True, choices=list(kug.VALID_COVERAGE),
+             help="UAT coverage grade. Only 'complete' clears the gate."),
+        _arg("--author", help="Attributable actor recorded on the verdict (default: active profile)"),
+    ], help="Record an exact machine-readable UAT verdict on a UAT card (durable, gate-read)"),
+    _cmd("gate-except", [
+        _TASK_ID,
+        _arg("--uat", required=True, metavar="CARD_ID",
+             help="The single declared UAT id this exception scopes to (no wildcards)"),
+        _arg("reason", nargs="+", help="Why the exception is granted (recorded for audit)"),
+        _arg("--actor", help="Attributable approver (default: active profile)"),
+        _arg("--expires-at", dest="expires_at", type=int, metavar="EPOCH",
+             help="Optional unix-epoch expiry; the exception is inert after it"),
+    ], help="Record an explicit, scoped, attributable UAT-gate exception (no broad bypass)"),
+    _cmd("gate-audit", [_json_flag()],
+         help="Audit gate typing: protected/UAT cards + their live gate status + untyped (ungated) count"),
     _cmd("gc", [
         _arg("--event-retention-days", type=int, default=30,
              help="Delete task_events older than N days for terminal tasks (default: 30)"),

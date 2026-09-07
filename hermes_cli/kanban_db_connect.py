@@ -813,6 +813,9 @@ _LATER_TASK_COLUMNS = (
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
+    # Explicit structured card/gate metadata (JSON) for the fail-closed UAT
+    # gate. NULL = untyped card (never gated). See hermes_cli.kanban_uat_gate.
+    ("gate", "gate TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
