@@ -2599,6 +2599,27 @@ def complete_task(
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False
+        # Fail-closed UAT gate at the terminal write boundary. ``complete_task``
+        # is the last write before ``done`` (and the child release that follows
+        # it); a protected merge/deploy/live card whose declared UAT is missing,
+        # incomplete, unparseable, FAIL, AMEND, or FAIL_AMEND must NOT reach
+        # ``done`` by ANY direct-completion route, whichever writer/operator
+        # parked it in a completable lane. This is the SAME predicate the
+        # promote/claim/dispatch paths enforce, so an untyped card, a UAT card,
+        # an all-PASS/complete protected card, and one cleared by an explicit,
+        # scoped, audited exception all still complete unchanged. Rejecting here
+        # (before the status flip) leaves the card non-done and its children
+        # unreleased. A supplied ``uat_verdict`` on a protected card is role
+        # confusion, deliberately left to the ValueError guard below so that
+        # API contract is unchanged.
+        if uat_verdict is None:
+            gate_decision = _uat.evaluate(conn, task_id)
+            if not gate_decision.allowed:
+                _append_event(
+                    conn, task_id, "completion_rejected",
+                    {"reason": "uat_gate", "detail": gate_decision.reason},
+                )
+                return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         prior_status = _task_status(conn, task_id)
