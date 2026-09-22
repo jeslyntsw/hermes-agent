@@ -314,6 +314,40 @@ KANBAN_GUIDANCE = (
     "own run; board tasks are for cross-agent handoffs that outlive one API loop."
 )
 
+
+def is_kanban_worker_session(tool_names) -> bool:
+    """Whether KANBAN_GUIDANCE — the dispatcher's WORKER protocol — applies to this session.
+
+    ``kanban_show`` in the schema is not proof of assignment: the ``kanban`` toolset exposes
+    the same tools to an ordinary chat/orchestrator session, which has no ``$HERMES_KANBAN_TASK``
+    to orient on and no workspace to cd into. Ownership is the contract the kanban tools already
+    use (``tools/kanban_tools.py::_visible``, ``model_tools._select_tool_names``): an assigned
+    task id AND ``delegation_context.is_dispatcher_owned_worker_context()``, so a cron tick or a
+    delegate child that merely INHERITED the worker's env is not promoted to one. Anything
+    unresolvable fails safe to "not a worker"; the tools themselves are never affected.
+    """
+    if "kanban_show" not in (tool_names or ()):
+        return False
+    if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return False
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+        return bool(is_dispatcher_owned_worker_context())
+    except Exception:
+        logger.debug("Kanban ownership unresolvable; treating session as non-worker", exc_info=True)
+        return False
+
+
+def kanban_worker_guidance(tool_names) -> str:
+    """Session-static worker protocol block, or ``""`` for every non-worker session.
+
+    Resolved ONCE per agent (``agent_init._load_tools``) so a later ambient env change cannot
+    move the system prompt mid-conversation; ``agent/system_prompt.py`` calls the same function
+    for agents constructed outside ``init_agent``.
+    """
+    return KANBAN_GUIDANCE if is_kanban_worker_session(tool_names) else ""
+
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do or plan to do without actually doing "
@@ -1319,15 +1353,20 @@ def _render_skills_index(
                 index_lines.append(f"    - {name}: {desc}" if desc else f"    - {name}")
     return (
         "## Skills\n"
-        "Before replying, scan the skills below. If a skill matches or is even partially relevant to your "
-        "task, you MUST load it with skill_view(name) and follow its instructions. Err on the side of "
-        "loading — it is always better to have context you don't need than to miss critical steps, pitfalls, "
-        "or established workflows. Skills contain specialized knowledge — API endpoints, tool-specific "
-        "commands, and proven workflows that outperform general-purpose approaches. Load the skill "
-        f"even if you think you could handle the task with basic tools like {_basic_tools}. "
+        "Before replying, scan the skills below. When your identity or project instructions state an "
+        "explicit skill-loading policy, that policy decides how many of these to load and when; the "
+        "default in this paragraph applies only in its absence. By default, if a skill matches or is even "
+        "partially relevant to your task, you MUST load it with skill_view(name) and follow its "
+        "instructions, erring on the side of loading — it is better to have context you don't need than to "
+        "miss critical steps, pitfalls, or established workflows. Skills contain specialized knowledge — API "
+        "endpoints, tool-specific commands, and proven workflows that outperform general-purpose approaches. "
+        f"Load the skill even if you think you could handle the task with basic tools like {_basic_tools}. "
         "Skills also encode the user's preferred approach, conventions, and quality standards for tasks like "
         "code review, planning, and testing — load them even for tasks you already know how to do, because "
         "the skill defines how it should be done here.\n"
+        "Under any policy: load a skill that carries a mandatory safety or specialist procedure for the work "
+        "at hand, reuse skill content already loaded in this conversation instead of fetching it again, and "
+        "reload content whose placeholder says `[SKILL_PRUNED]`.\n"
         "If a skill has issues, fix it with skill_manage(action='patch').\n"
         "After difficult/iterative tasks, offer to save as a skill. If a skill you loaded was missing steps, "
         "had wrong commands, or needed pitfalls you discovered, update it before finishing.\n"
@@ -1335,7 +1374,7 @@ def _render_skills_index(
         "<available_skills>\n"
         + "\n".join(index_lines) + "\n"
         "</available_skills>\n\n"
-        "Only proceed without loading a skill if genuinely none are relevant to the task."
+        "Absent such a policy, only proceed without loading a skill if genuinely none are relevant to the task."
         + hidden_note
     )
 

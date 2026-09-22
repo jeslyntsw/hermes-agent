@@ -1068,11 +1068,10 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     )
 
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
-    # Kanban guidance is session-static (kanban_show iff HERMES_KANBAN_TASK); resolve once.
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
-    )
+    # The worker protocol belongs to a dispatcher-owned assigned task, not to every session
+    # that can see the kanban tools; session-static, so resolve once.
+    from agent.prompt_builder import kanban_worker_guidance
+    agent._kanban_worker_guidance = kanban_worker_guidance(agent.valid_tool_names)
     if agent.quiet_mode:
         return
     if agent.tools:
