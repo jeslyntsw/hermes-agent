@@ -3,12 +3,11 @@
 A profile whose SOUL.md (or a project context file) states a selective skill-loading
 policy was handed a generated block ordering the opposite in the same prompt
 ("you MUST load ... Err on the side of loading ... load them even for tasks you
-already know how to do"). The generated wording is the *default*, so it defers to an
-explicit policy when one exists and keeps its blanket behaviour when none does.
+already know how to do"). The generated wording no longer carries a blanket default
+at all: the block states one policy sentence — the soul's policy decides, and pruned
+content is reloaded — and otherwise carries only the index itself.
 
-Three things survive either way and are asserted as such: mandatory safety/specialist
-procedures stay loadable, content already in context is reused instead of re-fetched,
-and genuinely `[SKILL_PRUNED]` content is reloaded.
+The authoritative Skill Safety Rule lives in SKILLS_GUIDANCE and is untouched.
 """
 
 from __future__ import annotations
@@ -17,6 +16,24 @@ import pytest
 
 from agent.prompt_builder import (
     SKILLS_GUIDANCE, build_skills_system_prompt, clear_skills_system_prompt_cache)
+
+POLICY_SENTENCE = "Soul policy wins; reload only if pruned."
+
+# Every scrap of the old instructional essay, which must not come back in any form.
+BANNED_FRAGMENTS = (
+    "MUST load",
+    "even partially relevant",
+    "erring on the side of loading",
+    "Err on the side of loading",
+    "Under any policy",
+    "mandatory safety or specialist procedure",
+    "already loaded in this conversation",
+    "basic tools like",
+    "Absent such a policy",
+    "proceed without loading",
+    "skill_manage(action='patch')",
+    "offer to save as a skill",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -36,65 +53,44 @@ def _index(tmp_path, monkeypatch, **kwargs):
     return build_skills_system_prompt(**kwargs)
 
 
-def test_blanket_load_directive_is_scoped_by_the_deferral_clause(tmp_path, monkeypatch):
-    """The relationship under test: the "load everything relevant" default must be
-    *preceded* by the clause that hands precedence to an explicit policy, so a model
-    reading top-down never meets the unconditional order first."""
+def test_block_states_exactly_the_one_policy_sentence(tmp_path, monkeypatch):
     prompt = _index(tmp_path, monkeypatch)
-    assert "explicit skill-loading policy" in prompt
-    assert "MUST load" in prompt, "the default must survive for profiles without a policy"
-    assert prompt.index("explicit skill-loading policy") < prompt.index("MUST load")
+    assert "## Skills" in prompt
+    assert POLICY_SENTENCE in prompt
 
 
-def test_default_behaviour_is_retained_when_no_policy_exists(tmp_path, monkeypatch):
-    """Absent an explicit policy the original err-on-the-side default still applies."""
+def test_instructional_essay_is_gone(tmp_path, monkeypatch):
+    """No fragment of the old default-loading essay survives anywhere in the block."""
     prompt = _index(tmp_path, monkeypatch)
-    assert "erring on the side of loading" in prompt or "Err on the side of loading" in prompt
-    assert "even partially relevant" in prompt
-    # The closing "proceed without loading" line is likewise conditioned, not absolute.
-    closing = prompt[prompt.index("proceed without loading"):]
-    qualifier = prompt[:prompt.index("proceed without loading")]
-    assert "Absent such a policy" in qualifier[-80:], (
-        f"the closing directive must be qualified by the same deferral; got {closing[:120]!r}")
-
-
-def test_safety_and_specialist_procedures_survive_any_policy(tmp_path, monkeypatch):
-    prompt = _index(tmp_path, monkeypatch)
-    assert "mandatory safety or specialist procedure" in prompt
-    # And the phrasing must make it unconditional rather than part of the default.
-    assert "Under any policy" in prompt
-
-
-def test_already_loaded_content_is_reused_not_refetched(tmp_path, monkeypatch):
-    prompt = _index(tmp_path, monkeypatch)
-    assert "already loaded in this conversation" in prompt
-    assert "reuse" in prompt.lower()
-
-
-def test_pruned_content_must_still_be_reloaded(tmp_path, monkeypatch):
-    """Reuse must never be read as "ignore the Skill Safety Rule"."""
-    prompt = _index(tmp_path, monkeypatch)
-    assert "[SKILL_PRUNED]" in prompt
-    assert "reload" in prompt.lower()
-    # The authoritative rule itself is untouched.
-    assert "## Skill Safety Rule" in SKILLS_GUIDANCE
-    assert "reload it with skill_view(name='...')" in SKILLS_GUIDANCE
+    for fragment in BANNED_FRAGMENTS:
+        assert fragment not in prompt, f"removed guidance resurfaced: {fragment!r}"
 
 
 def test_index_boundaries_and_gates_are_unchanged(tmp_path, monkeypatch):
-    """Everything the block already promised keeps working."""
+    """Everything the block still promises keeps working."""
     prompt = _index(tmp_path, monkeypatch)
     assert "<available_skills>" in prompt and "</available_skills>" in prompt
     assert "- demo-skill: Demo skill for the index." in prompt
-    assert "skill_manage(action='patch')" in prompt
-    # No skills, no block.
-    clear_skills_system_prompt_cache(clear_snapshot=True)
+    # The tags wrap the index rather than trailing it.
+    assert prompt.index("<available_skills>") < prompt.index("- demo-skill:")
+    assert prompt.index("- demo-skill:") < prompt.index("</available_skills>")
+
+
+def test_no_skills_means_no_block(tmp_path, monkeypatch):
+    """An empty skills dir still yields no block at all."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty"))
     assert build_skills_system_prompt() == ""
 
 
-def test_dangling_tool_reference_rule_is_unchanged(tmp_path, monkeypatch):
-    """The basic-tools example still drops web_search when the session has no web tools."""
+def test_skill_safety_rule_still_lives_in_the_guidance():
+    """Reload-when-pruned stays authoritative in SKILLS_GUIDANCE, not in the index block."""
+    assert "## Skill Safety Rule" in SKILLS_GUIDANCE
+    assert "reload it with skill_view(name='...')" in SKILLS_GUIDANCE
+
+
+def test_tool_availability_does_not_alter_the_policy_sentence(tmp_path, monkeypatch):
+    """With no web tools the block neither names web_search nor revives the basic-tools example."""
     prompt = _index(tmp_path, monkeypatch, available_tools={"terminal"})
-    assert "basic tools like terminal" in prompt
+    assert POLICY_SENTENCE in prompt
     assert "web_search" not in prompt
+    assert "basic tools like" not in prompt
