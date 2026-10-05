@@ -138,6 +138,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
     cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len,
+    fit_rendered_prompt,
 )
 
 # Every refused button tap answers with the same sentence.
@@ -3832,6 +3833,17 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] %s failed: %s", self.name, what, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    def _fit_prompt_text(self, source: str, render) -> str:
+        """Render a control prompt so the SENT payload fits one message (4096 UTF-16 units).
+
+        Every prompt here wraps agent- or user-sized text (a command, a slash-command preview, a
+        clarify question) in a small frame, and the frame escapes it — so the cut belongs on the
+        SOURCE, with the frame re-rendered around it, not on a raw-char budget that escaping and
+        UTF-16 both outgrow. ``send()`` chunks an oversize reply; a prompt cannot be chunked
+        (the keyboard rides one message), and Telegram rejects the whole payload — no buttons.
+        """
+        return fit_rendered_prompt(str(source or ""), render, self.MAX_MESSAGE_LENGTH)
+
     @staticmethod
     def _rows_of_two(buttons: list) -> list:
         """2-per-row layout keeps labels readable on mobile (a 4-button row truncates)."""
@@ -3842,7 +3854,10 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send an inline-keyboard Yes/No prompt for the gateway ``/update`` watcher."""
         def build():
             default_hint = f" (default: {default})" if default else ""
-            text = self.format_message(f"☤ *Update needs your input:*\n\n{prompt}{default_hint}")
+            # The hint rides the frame, not the source: it must survive a cut to the question.
+            text = self._fit_prompt_text(
+                prompt,
+                lambda body: self.format_message(f"☤ *Update needs your input:*\n\n{body}{default_hint}"))
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("✓ Yes", callback_data="update_prompt:y"),
                 InlineKeyboardButton("✗ No", callback_data="update_prompt:n")]])
@@ -3855,7 +3870,14 @@ class TelegramAdapter(BasePlatformAdapter):
     _EA_CODE_OPEN = "<pre>"
     _EA_CODE_CLOSE = "</pre>\n\n"
     _EA_SMART_DENY_LINE = "\n\n<b>Smart DENY:</b> owner override applies to this one operation only."
-    _EA_CMD_BUDGET = 3800
+    # The real cut is made by ``_fit_prompt_text`` on the MEASURED rendering; these two only keep
+    # the shared formatter's inputs sane. A command at the message cap can never fit once it is
+    # HTML-escaped and framed, so this ceiling never swallows the truncation marker — it just
+    # stops the escaper chewing through a multi-megabyte command on every search step. The reason
+    # is bounded because it is the only other unbounded field: shrinking the command cannot
+    # rescue a frame that overflows on its own.
+    _EA_CMD_BUDGET = MAX_MESSAGE_LENGTH
+    _EA_REASON_BUDGET = 500
 
     def _ea_escape(self, text: str) -> str:
         return _html.escape(text)
@@ -3873,7 +3895,12 @@ class TelegramAdapter(BasePlatformAdapter):
             approval_id = next(self._approval_counter)
             buttons = [InlineKeyboardButton(label, callback_data=f"ea:{choice}:{approval_id}")
                        for label, choice, _ in prompt.actions]
-            return prompt.text, InlineKeyboardMarkup(self._rows_of_two(buttons)), (
+            # Re-render the shared card around a command short enough to send: the command is the
+            # only unbounded part, and the escaped <pre> block it lands in is what blows the cap.
+            text = self._fit_prompt_text(
+                prompt.command,
+                lambda command: self._format_exec_approval(command, prompt.description, prompt.smart_denied))
+            return text, InlineKeyboardMarkup(self._rows_of_two(buttons)), (
                 lambda msg: self._approval_state.__setitem__(approval_id, prompt.session_key))
         return await self._send_prompt(
             "send_exec_approval", prompt.chat_id, prompt.metadata, build, parse_mode=ParseMode.HTML,
@@ -3890,7 +3917,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     InlineKeyboardButton("🔒 Always Approve", callback_data=f"sc:always:{confirm_id}")],
                 [InlineKeyboardButton("❌ Cancel", callback_data=f"sc:cancel:{confirm_id}")],
            ])
-            preview = self.format_message(self._truncate_preview(message, 3800))
+            preview = self._fit_prompt_text(message, self.format_message)
             return preview, keyboard, lambda msg: self._slash_confirm_state.__setitem__(confirm_id, session_key)
         return await self._send_prompt(
             "send_slash_confirm", chat_id, metadata, build, thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode)
@@ -3901,15 +3928,20 @@ class TelegramAdapter(BasePlatformAdapter):
         """Render a clarify prompt: numbered buttons per choice plus "✏️ Other (type answer)" (flips to
         text-capture mode); without choices, plain question and the gateway text-intercept captures."""
         def build():
-            text = f"❓ {_html.escape(question)}"
+            # Body assembled UNESCAPED so the fitter can cut it; ``_html.escape`` is per-character,
+            # so escaping the joined body is byte-identical to escaping each part.
+            body = str(question or "")
             keyboard = None
             if choices:
                 # Full option text in the body (mobile truncates button labels); buttons keep numeric labels.
-                text += "\n\n" + "\n".join(f"{i + 1}. {_html.escape(str(c))}" for i, c in enumerate(choices))
+                body += "\n\n" + "\n".join(f"{i + 1}. {c}" for i, c in enumerate(choices))
                 # Telegram caps callback_data at 64 bytes; keep "cl:<id>:<idx>" short.
                 rows = [[InlineKeyboardButton(str(idx + 1), callback_data=f"cl:{clarify_id}:{idx}")] for idx in range(len(choices))]
                 rows.append([InlineKeyboardButton("✏️ Other (type answer)", callback_data=f"cl:{clarify_id}:other")])
                 keyboard = InlineKeyboardMarkup(rows)
+            # A trimmed body keeps every numbered button answerable — the keyboard is built from the
+            # full choice list, so the mapping a tap resolves through is never the part that is cut.
+            text = self._fit_prompt_text(body, lambda b: f"❓ {_html.escape(b)}")
             return text, keyboard, lambda msg: self._clarify_state.__setitem__(clarify_id, session_key)
         return await self._send_prompt(
             "send_clarify", chat_id, metadata, build, parse_mode=ParseMode.HTML, thread_id=self._metadata_thread_id(metadata))
