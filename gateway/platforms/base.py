@@ -227,6 +227,51 @@ def _prefix_within_utf16_limit(s: str, limit: int) -> str:
     return s[:_custom_unit_to_cp(s, limit, utf16_len)]
 
 
+def prompt_truncation_marker(dropped: int) -> str:
+    """Marker appended to a shortened prompt SOURCE — before the frame escapes and renders it."""
+    return f"\n… (truncated, {dropped} chars)"
+
+
+def fit_rendered_prompt(
+    source: str,
+    render: "Callable[[str], str]",
+    limit: int,
+    len_fn: "Optional[Callable[[str], int]]" = None,
+    marker: "Callable[[int], str]" = prompt_truncation_marker,
+) -> str:
+    """``render(source)`` when it fits ``limit``, else the longest ``render(prefix + marker)`` that does.
+
+    A prompt carries its buttons, so it cannot be chunked the way a long reply is: a payload over
+    the platform's one-message cap is rejected whole and the user never sees the approval at all.
+    A character budget on the raw text cannot express that cap either — the escaper runs *after*
+    it (``&`` → ``&amp;``, ``.`` → ``\\.``) and Telegram then counts UTF-16 code units, so one
+    emoji costs two and one ``&`` costs five. So measure what is actually sent: shrink the variable
+    SOURCE and let the frame re-render around it.
+
+    Cutting the source rather than the rendering is what keeps markup valid — ``render`` escapes
+    and wraps the shortened text itself, so no entity is left half-written and no tag or fence is
+    left open. Only a candidate that has been *measured* is ever returned, so a ``render`` that is
+    not monotonic in its input length costs a slightly shorter result, never an oversized one.
+    ``render("")`` is the floor: callers keep the fixed frame (header, reason, deadline) bounded
+    themselves, because no amount of shrinking can get under a frame that overflows on its own.
+    """
+    _len = len_fn or utf16_len
+    rendered = render(source)
+    if _len(rendered) <= limit:
+        return rendered
+    best = None
+    # hi excludes len(source): that prefix drops nothing, and "truncated, 0 chars" is a lie.
+    lo, hi = 0, len(source) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = render(source[:mid] + marker(len(source) - mid))
+        if _len(candidate) <= limit:
+            best, lo = candidate, mid + 1
+        else:
+            hi = mid - 1
+    return best if best is not None else render(marker(len(source)))
+
+
 def is_network_accessible(host: str) -> bool:
     """True if *host* would expose the server beyond loopback (incl. IPv4-mapped
     ::ffff:127.0.0.1); hostnames are resolved and DNS failure fails closed (True)."""
@@ -2457,6 +2502,7 @@ class BasePlatformAdapter(ABC):
     _EA_REASON_LABEL: str = "Reason: "
     _EA_SMART_DENY_LINE: str = "\n\nSmart DENY: owner override applies to this one operation only."
     _EA_CMD_BUDGET: int = 3000
+    _EA_REASON_BUDGET: int = 0  # 0 = the reason is never truncated
 
     @staticmethod
     def _truncate_preview(text: str, budget: int, suffix: str = "...") -> str:
@@ -2472,6 +2518,10 @@ class BasePlatformAdapter(ABC):
         self, command: str, description: str = "dangerous command", smart_denied: bool = False) -> str:
         """Shared exec-approval prompt text: header + fenced (truncated) command + reason,
         plus the smart-deny line. Buttons/trailing instructions stay platform-local."""
+        # Platforms with a hard one-message cap bound the reason too: it is the only other
+        # unbounded field, and shrinking the command cannot rescue a frame that overflows alone.
+        if self._EA_REASON_BUDGET:
+            description = self._truncate_preview(str(description or ""), self._EA_REASON_BUDGET)
         cmd_preview = self._truncate_preview(str(command or ""), self._EA_CMD_BUDGET)
         text = (f"{self._EA_HEADER}"
                 f"{self._EA_CODE_OPEN}{self._ea_escape(cmd_preview)}{self._EA_CODE_CLOSE}"
