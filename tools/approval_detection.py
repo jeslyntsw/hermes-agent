@@ -445,7 +445,11 @@ DANGEROUS_PATTERNS = [
     # by git before mode resolution.
     (r'\bgit\s+reset\s+--h(?:a(?:r(?:d)?)?)?\b', "git reset --hard (destroys uncommitted changes)"),
     (r'\bgit\s+push\b.*--forc[a-z]*\b', "git force push (rewrites remote history)"),
-    (r'\bgit\s+push\b.*-f\b', "git force push short flag (rewrites remote history)"),
+    # The short force flag is an OPTION TOKEN: the cluster starts a whitespace-delimited `-` after
+    # `git push` and carries `f` anywhere in it (-f, -uf, -fu). `.*-f\b` matched the characters
+    # instead, so it missed `-uf`/`-fu` and prompted on every ref whose name ends in `-f`
+    # (`git push origin my-f`). Bounded to one command segment like the branch rules below.
+    (r'\bgit\s+push\b[^;|&\n]*\s-[a-z]*f[a-z]*\b', "git force push short flag (rewrites remote history)"),
     (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
     # `-D` = `-d --force`: only the capital short flag is force-delete, so the group opts out of
     # the module-wide re.IGNORECASE and relies on _lower_preserving_flags keeping dash-prefixed
