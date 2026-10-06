@@ -1192,6 +1192,35 @@ class TestGitDestructiveOps:
             assert dangerous is False, cmd
 
 
+    # Force push is a property of the OPTION TOKEN, not of the characters `-f` anywhere in the
+    # command: the short-option cluster starts a whitespace-delimited token after `git push` and
+    # carries `f` somewhere in the cluster, so -f, -uf and -fu all force.
+    @pytest.mark.parametrize("command", [
+        "git push -f",
+        "git push -f origin main",
+        "git push origin main -f",
+        "git push -uf origin x",
+        "git push --force",
+        "git push --force-with-lease",
+    ])
+    def test_force_push_spellings_flagged(self, command):
+        dangerous, _, desc = detect_dangerous_command(command)
+        assert dangerous is True, command
+        assert "force" in desc.lower(), command
+
+
+    # A `-f` glued into a remote, branch or ref name is not an option token; prompting on it trains
+    # the user to approve ordinary pushes.
+    @pytest.mark.parametrize("command", [
+        "git push -u github recurring-f-f1-default",
+        "git push origin feature-fix",
+        "git push origin my-f",
+        "git push github HEAD:refs/heads/x-f",
+    ])
+    def test_f_inside_ref_name_not_flagged(self, command):
+        assert detect_dangerous_command(command) == (False, None, None)
+
+
 class TestChmodExecuteCombo:
     """chmod +x && ./ is the two-step social engineering pattern where a
     script is first made executable then immediately run. The script
