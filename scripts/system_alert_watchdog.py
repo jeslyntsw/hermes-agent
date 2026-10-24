@@ -404,7 +404,7 @@ def _default_telegram_transport(message: str) -> dict:
     try:
         from gateway.config import load_gateway_config, Platform
         from tools.send_message_tool import _send_to_platform
-        from cron.scheduler import (
+        from cron.scheduler_delivery import (
             _get_home_target_chat_id,
             _get_home_target_thread_id,
         )
