@@ -152,3 +152,24 @@ class MessageEvent:
         args = parts[1] if len(parts) > 1 else ""
         # iOS auto-corrects -- to — (em dash) and - to – (en dash)
         return args.replace("\u2014\u2014", "--").replace("\u2014", "--").replace("\u2013", "-")
+
+
+def padded_inline_flags(event: MessageEvent) -> list[Optional[bool]]:
+    """``event``'s inline flags, one per attachment: an adapter that answered for none of them
+    (a photo burst) or only for the first file pads out with ``None`` = "no answer"."""
+    flags = list(getattr(event, "media_text_inlined", None) or [])
+    return flags + [None] * (len(event.media_urls) - len(flags))
+
+
+def extend_event_media(existing: MessageEvent, event: MessageEvent) -> None:
+    """Append ``event``'s attachments to ``existing`` — the one merge every batcher uses.
+
+    Both flag lists are padded first: a merged list that is neither empty nor one entry per URL
+    is refused at native admission (``session_envelope._media_clause``), and a short one reads
+    the next attachment's answer against an earlier file.
+    """
+    incoming_flags = padded_inline_flags(event)
+    existing.media_text_inlined = padded_inline_flags(existing)
+    existing.media_urls.extend(event.media_urls)
+    existing.media_types.extend(event.media_types)
+    existing.media_text_inlined.extend(incoming_flags)

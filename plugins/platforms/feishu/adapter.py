@@ -91,7 +91,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES, cache_document_from_bytes_async, cache_image_from_url,
     cache_audio_from_bytes_async, cache_image_from_bytes_async,
 )
-from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome, extend_event_media
 from gateway.status import acquire_scoped_lock
 from gateway.status_scoped_locks import release_scoped_lock
 from hermes_constants import get_hermes_home
@@ -2706,9 +2706,7 @@ class FeishuAdapter(BasePlatformAdapter):
             self._pending_media_batches[key] = event
             self._schedule_media_batch_flush(key)
             return
-        existing.media_urls.extend(event.media_urls)
-        existing.media_types.extend(event.media_types)
-        existing.media_text_inlined.extend(event.media_text_inlined)
+        extend_event_media(existing, event)
         if event.text:
             existing.text = self._merge_caption(existing.text, event.text)
         existing.timestamp = event.timestamp
@@ -2969,9 +2967,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return
 
         existing.text = next_text
-        existing.media_urls.extend(event.media_urls)
-        existing.media_types.extend(event.media_types)
-        existing.media_text_inlined.extend(event.media_text_inlined)
+        extend_event_media(existing, event)
         existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
         existing.timestamp = event.timestamp
         if event.message_id:
